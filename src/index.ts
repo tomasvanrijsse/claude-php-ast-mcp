@@ -15,27 +15,18 @@ const MAGO_PATH = process.env.MAGO_PATH || "mago";
 // Types
 // ---------------------------------------------------------------------------
 
-interface MethodInfo {
+interface MethodOutline {
   name: string;
-  visibility: string;
   start_line: number;
   end_line: number;
-  params: string[];
-  return_type: string | null;
 }
 
-interface PropertyInfo {
-  name: string;
-  visibility: string;
-  type: string | null;
-}
-
-interface ClassInfo {
+interface ClassOutline {
   class: string;
   namespace: string | null;
   extends: string | null;
-  methods: MethodInfo[];
-  properties: PropertyInfo[];
+  implements: string[];
+  methods: MethodOutline[];
 }
 
 // ---------------------------------------------------------------------------
@@ -63,9 +54,6 @@ function offsetToLine(lineIndex: number[], offset: number): number {
 
 // ---------------------------------------------------------------------------
 // Mago AST span helpers
-//
-// Mago span format: { file_id: N, start: { offset: N }, end: { offset: N } }
-// Token span (no file_id): same shape, just missing file_id
 // ---------------------------------------------------------------------------
 
 type SpanRange = { start: number; end: number };
@@ -84,15 +72,13 @@ function getMagoSpanRange(spanLike: unknown): SpanRange | null {
   return null;
 }
 
-// Node that carries a .span sub-field, e.g. { span: {...}, value: "Foo" }
 function getNodeSpan(node: Record<string, unknown>): SpanRange | null {
   if (node.span) return getMagoSpanRange(node.span);
-  return getMagoSpanRange(node); // token IS the span
+  return getMagoSpanRange(node);
 }
 
 // ---------------------------------------------------------------------------
 // Mago value-node helpers
-// Node pattern: { type: "TypeName", value: { ... } }
 // ---------------------------------------------------------------------------
 
 function nodeValue(node: unknown): Record<string, unknown> | null {
@@ -119,75 +105,17 @@ function nodesOf(container: unknown): unknown[] {
 }
 
 // ---------------------------------------------------------------------------
-// Name / string extraction
+// Name / FQN extraction
 // ---------------------------------------------------------------------------
 
 function extractMagoName(val: unknown): string | null {
   if (typeof val === "string") return val;
   if (!val || typeof val !== "object") return null;
   const v = val as Record<string, unknown>;
-  // { span: {...}, value: "Foo" }
   if (typeof v.value === "string") return v.value;
-  // { span: {...}, name: "$name" } (variable nodes)
   if (typeof v.name === "string") return v.name;
   return null;
 }
-
-// ---------------------------------------------------------------------------
-// Type hint extraction
-// Mago type hints: { type: "Void"|"String"|...|"Local"|"Named"|"Nullable"|"Union"|..., value: {...} }
-// ---------------------------------------------------------------------------
-
-const BUILTIN_TYPE_KINDS = new Set([
-  "Void", "String", "Int", "Integer", "Float", "Bool", "Boolean",
-  "Array", "Object", "Mixed", "Never", "Null", "False", "True",
-  "Static", "Self", "Parent", "Iterable", "Callable",
-]);
-
-const NAMED_TYPE_KINDS = new Set(["Local", "Named", "FullyQualified", "Qualified"]);
-
-function extractMagoTypeHint(node: unknown): string | null {
-  if (!node || typeof node !== "object") return null;
-  const kind = nodeType(node);
-  if (!kind) return null;
-  const inner = nodeValue(node);
-
-  // Built-in scalar/special types — value contains { span, value: "string" }
-  if (BUILTIN_TYPE_KINDS.has(kind)) {
-    if (inner && typeof inner.value === "string") return inner.value;
-    return kind.toLowerCase();
-  }
-
-  // Named / Local / FullyQualified / Qualified
-  if (NAMED_TYPE_KINDS.has(kind) && inner && typeof inner.value === "string") {
-    return inner.value;
-  }
-
-  if (!inner) return null;
-
-  // Identifier wraps a Local/Named node
-  if (kind === "Identifier") return extractMagoTypeHint(inner);
-
-  // Nullable: { type: "Nullable", value: { hint: {...} } }
-  if (kind === "Nullable") {
-    const hint = extractMagoTypeHint(inner.hint);
-    return hint ? "?" + hint : null;
-  }
-
-  // Union / Intersection: { type: "Union", value: { types: { nodes: [...] } } }
-  if (kind === "Union" || kind === "Intersection") {
-    const separator = kind === "Union" ? "|" : "&";
-    const parts = nodesOf(inner.types).map(extractMagoTypeHint).filter(Boolean);
-    return parts.length > 0 ? parts.join(separator) : null;
-  }
-
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// Extends / implements extraction
-// { type: "Local"|"Named"|..., value: { span: {...}, value: "Bar" } }
-// ---------------------------------------------------------------------------
 
 function extractMagoFqn(node: unknown): string | null {
   if (!node || typeof node !== "object") return null;
@@ -196,13 +124,12 @@ function extractMagoFqn(node: unknown): string | null {
   const inner = nodeValue(n);
   if (inner && typeof inner.value === "string") return inner.value;
   if (inner) {
-    // Qualified: { parts: { nodes: [{ span: {...}, value: "App" }, ...] } }
     const parts = nodesOf(inner.parts);
     if (parts.length > 0) {
       return parts.map(extractMagoName).filter(Boolean).join("\\");
     }
   }
-  if (kind && typeof kind === "string") return kind; // fallback
+  if (kind && typeof kind === "string") return kind;
   return null;
 }
 
@@ -213,65 +140,13 @@ function extractImplementsList(typesContainer: unknown): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Visibility / modifiers
-// Modifiers are { type: "Public"|"Private"|"Protected"|"Static"|"Abstract"|..., value: {...} }
-// ---------------------------------------------------------------------------
-
-function extractModifiers(modifiersContainer: unknown): string[] {
-  return nodesOf(modifiersContainer)
-    .map(nodeType)
-    .filter((t): t is string => t !== null)
-    .map((t) => t.toLowerCase());
-}
-
-function extractVisibilityFromModifiers(modifiers: string[]): string {
-  for (const m of modifiers) {
-    if (m === "public" || m === "protected" || m === "private") return m;
-  }
-  return "public";
-}
-
-// ---------------------------------------------------------------------------
-// Parameter extraction
-// Parameter node (not wrapped in type/value): { hint: {...}, variable: { span: {...}, name: "$foo" }, default_value: null }
-// ---------------------------------------------------------------------------
-
-function extractMagoParameters(paramListNode: unknown): string[] {
-  if (!paramListNode || typeof paramListNode !== "object") return [];
-  const pl = paramListNode as Record<string, unknown>;
-
-  const params = nodesOf(pl.parameters);
-  if (params.length > 0) return parseParamNodes(params);
-
-  // Fallback: parameter list might be a bare { nodes: [...] } container
-  return parseParamNodes(nodesOf(pl));
-}
-
-function parseParamNodes(nodes: unknown[]): string[] {
-  return nodes
-    .map((p): string | null => {
-      if (!p || typeof p !== "object") return null;
-      const param = p as Record<string, unknown>;
-
-      const name = extractMagoName(param.variable) ?? "?";
-      const type = extractMagoTypeHint(param.hint ?? param.type_hint ?? param.type ?? null);
-      const hasDefault = param.default_value !== null && param.default_value !== undefined;
-
-      let result = type ? `${type} ${name}` : name;
-      if (hasDefault) result += " = ...";
-      return result;
-    })
-    .filter((p): p is string => p !== null);
-}
-
-// ---------------------------------------------------------------------------
-// Method extraction from class members list
+// Method outline extraction — name + line range only
 // ---------------------------------------------------------------------------
 
 const METHOD_TYPES = new Set(["Method", "AbstractMethod", "ConcreteMethod"]);
 
-function extractMagoMethods(membersContainer: unknown, lineIndex: number[]): MethodInfo[] {
-  const methods: MethodInfo[] = [];
+function extractMagoMethods(membersContainer: unknown, lineIndex: number[]): MethodOutline[] {
+  const methods: MethodOutline[] = [];
 
   for (const member of nodesOf(membersContainer)) {
     const kind = nodeType(member);
@@ -280,10 +155,8 @@ function extractMagoMethods(membersContainer: unknown, lineIndex: number[]): Met
     const methodValue = nodeValue(member);
     if (!methodValue) continue;
 
-    const modifiers = extractModifiers(methodValue.modifiers);
     const name = extractMagoName(methodValue.name) ?? "<anonymous>";
 
-    // Start line: first modifier span, or the `function` keyword span
     let startOffset: number | null = null;
     const firstModifier = nodesOf(methodValue.modifiers)[0];
     if (firstModifier) {
@@ -298,11 +171,9 @@ function extractMagoMethods(membersContainer: unknown, lineIndex: number[]): Met
       if (fnSpan) startOffset = fnSpan.start;
     }
 
-    // End line: body's right_brace or semicolon
     let endOffset: number | null = null;
     const body = methodValue.body;
     if (body && typeof body === "object") {
-      const bodyKind = nodeType(body);
       const bodyVal = nodeValue(body as Record<string, unknown>);
       if (bodyVal) {
         const rb = getNodeSpan(bodyVal.right_brace as Record<string, unknown>);
@@ -313,7 +184,6 @@ function extractMagoMethods(membersContainer: unknown, lineIndex: number[]): Met
         }
       }
     }
-    // If still no end, use the name span end as fallback
     if (endOffset === null) {
       const nameSpan = getNodeSpan(methodValue.name as Record<string, unknown>);
       if (nameSpan) endOffset = nameSpan.end;
@@ -321,58 +191,14 @@ function extractMagoMethods(membersContainer: unknown, lineIndex: number[]): Met
 
     if (startOffset === null || endOffset === null) continue;
 
-    const returnTypeNode = methodValue.return_type_hint;
-    let returnType: string | null = null;
-    if (returnTypeNode && typeof returnTypeNode === "object") {
-      const rtn = returnTypeNode as Record<string, unknown>;
-      returnType = extractMagoTypeHint(rtn.hint);
-    }
-
-    const params = extractMagoParameters(methodValue.parameter_list);
-
     methods.push({
       name,
-      visibility: extractVisibilityFromModifiers(modifiers),
       start_line: offsetToLine(lineIndex, startOffset),
       end_line: offsetToLine(lineIndex, endOffset),
-      params,
-      return_type: returnType,
     });
   }
 
   return methods;
-}
-
-// ---------------------------------------------------------------------------
-// Property extraction from class members list
-// Property node: { type: "Property", value: { type: "Plain", value: { modifiers, hint, items } } }
-// ---------------------------------------------------------------------------
-
-function extractMagoProperties(membersContainer: unknown): PropertyInfo[] {
-  const properties: PropertyInfo[] = [];
-
-  for (const member of nodesOf(membersContainer)) {
-    if (nodeType(member) !== "Property") continue;
-
-    const outerValue = nodeValue(member);
-    if (!outerValue) continue;
-
-    // Double-wrapped: { type: "Property", value: { type: "Plain", value: { ... } } }
-    const propValue = nodeValue(outerValue) ?? outerValue;
-
-    const modifiers = extractModifiers(propValue.modifiers);
-    const visibility = extractVisibilityFromModifiers(modifiers);
-    const type = extractMagoTypeHint(propValue.hint ?? null);
-
-    for (const item of nodesOf(propValue.items)) {
-      if (!item || typeof item !== "object") continue;
-      const itemVal = nodeValue(item) ?? (item as Record<string, unknown>);
-      const name = extractMagoName(itemVal.variable) ?? "?";
-      properties.push({ name, visibility, type });
-    }
-  }
-
-  return properties;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,39 +211,31 @@ const CLASS_LIKE_TYPES = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// Main AST traversal — collect all class-like declarations
-// Recursively walks statement lists, following namespace bodies.
+// Main AST traversal — collect class outlines
 // ---------------------------------------------------------------------------
 
-function collectClasses(
+function collectClassOutlines(
   statementNodes: unknown[],
   lineIndex: number[],
-  currentNamespace: string | null = null,
-  methodFilter: string | null = null
-): ClassInfo[] {
-  const results: ClassInfo[] = [];
+  currentNamespace: string | null = null
+): ClassOutline[] {
+  const results: ClassOutline[] = [];
 
   for (const stmt of statementNodes) {
     const kind = nodeType(stmt);
     if (!kind) continue;
 
-    // Namespace statement: recurse into body
     if (kind === "Namespace" || kind === "NamespaceDeclaration" || kind === "NamespaceStatement") {
       const nsValue = nodeValue(stmt);
       if (!nsValue) continue;
-
       const nsName = extractMagoFqn(nsValue.name) ?? currentNamespace;
-
-      // Body can be Implicit (semicolon-terminated) or Explicit (braced)
       const bodyVal = nodeValue(nsValue.body);
       if (!bodyVal) continue;
-
       const bodyStatements = nodesOf(bodyVal.statements);
-      results.push(...collectClasses(bodyStatements, lineIndex, nsName, methodFilter));
+      results.push(...collectClassOutlines(bodyStatements, lineIndex, nsName));
       continue;
     }
 
-    // Class-like declaration
     if (CLASS_LIKE_TYPES.has(kind)) {
       const classValue = nodeValue(stmt);
       if (!classValue) continue;
@@ -432,17 +250,20 @@ function collectClasses(
         if (extendsNodes.length > 0) extendsName = extractMagoFqn(extendsNodes[0]);
       }
 
-      let methods = extractMagoMethods(classValue.members, lineIndex);
-      if (methodFilter) methods = methods.filter((m) => m.name === methodFilter);
+      let implementsList: string[] = [];
+      if (classValue.implements && typeof classValue.implements === "object") {
+        const implementsObj = classValue.implements as Record<string, unknown>;
+        implementsList = extractImplementsList(implementsObj.types);
+      }
 
-      const properties = extractMagoProperties(classValue.members);
+      const methods = extractMagoMethods(classValue.members, lineIndex);
 
       results.push({
         class: className,
         namespace: currentNamespace,
         extends: extendsName,
+        implements: implementsList,
         methods,
-        properties,
       });
     }
   }
@@ -451,10 +272,10 @@ function collectClasses(
 }
 
 // ---------------------------------------------------------------------------
-// Tool: get_class_structure
+// Tool: get_class_outline
 // ---------------------------------------------------------------------------
 
-function getClassStructure(filePath: string, methodFilter: string | null = null): ClassInfo[] {
+function getClassOutline(filePath: string): ClassOutline[] {
   if (!fs.existsSync(filePath)) {
     throw new Error(`File not found: ${filePath}`);
   }
@@ -484,12 +305,28 @@ function getClassStructure(filePath: string, methodFilter: string | null = null)
     throw new Error("mago produced invalid JSON. Check mago version and --json flag support.");
   }
 
-  // Top-level: { program: { statements: { nodes: [...] } } }
   const prog = (ast as Record<string, unknown>).program as Record<string, unknown> | undefined;
   if (!prog) throw new Error("Unexpected mago AST shape: missing 'program' key.");
 
   const topNodes = nodesOf(prog.statements);
-  return collectClasses(topNodes, lineIndex, null, methodFilter);
+  return collectClassOutlines(topNodes, lineIndex);
+}
+
+// ---------------------------------------------------------------------------
+// Tool: get_method
+// ---------------------------------------------------------------------------
+
+function getMethod(filePath: string, methodName: string): string {
+  const classes = getClassOutline(filePath);
+
+  for (const cls of classes) {
+    const method = cls.methods.find((m) => m.name === methodName);
+    if (method) {
+      return readLines(filePath, method.start_line, method.end_line);
+    }
+  }
+
+  throw new Error(`Method '${methodName}' not found in ${filePath}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -593,29 +430,39 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
-      name: "get_class_structure",
+      name: "get_class_outline",
       description:
-        "Use this BEFORE reading any PHP file. Returns all classes/interfaces/traits/enums with " +
-        "method stubs (name, visibility, params, return type, line range) and properties. " +
-        "Pass method_name to get only that one method's stub. Use read_lines to read the body. " +
-        "Requires mago to be installed (set MAGO_PATH env var if not on PATH).",
+        "Returns only method names and line ranges for a PHP class. " +
+        "No signatures, no types, no bodies. Use this first to orient, " +
+        "then call get_method or read_lines for the actual code.",
       inputSchema: {
         type: "object",
         properties: {
           file_path: { type: "string", description: "Absolute path to the PHP file" },
-          method_name: {
-            type: "string",
-            description: "Optional: return only the stub for this method name",
-          },
         },
         required: ["file_path"],
       },
     },
     {
+      name: "get_method",
+      description:
+        "Reads the full source code of a single PHP method by name. " +
+        "Call get_class_outline first if you don't know the method name. " +
+        "Prefer this over read_lines for reading PHP methods.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          file_path: { type: "string", description: "Absolute path to the PHP file" },
+          method_name: { type: "string", description: "Name of the method to read" },
+        },
+        required: ["file_path", "method_name"],
+      },
+    },
+    {
       name: "read_lines",
       description:
-        "Read a specific line range from any file. Use after get_class_structure to read only " +
-        "the method you care about instead of loading the whole file.",
+        "Read a specific line range from any file. Use for code outside a named method " +
+        "(e.g. top-level statements, anonymous classes, or arbitrary line ranges).",
       inputSchema: {
         type: "object",
         properties: {
@@ -650,7 +497,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "debug_ast",
       description:
         "Returns the raw mago AST JSON (first 4 KB) for a PHP file. " +
-        "Use this to inspect the AST structure when get_class_structure returns unexpected results.",
+        "Use this to inspect the AST structure when get_class_outline returns unexpected results.",
       inputSchema: {
         type: "object",
         properties: {
@@ -662,10 +509,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
-const GetClassStructureInput = z.object({
-  file_path: z.string(),
-  method_name: z.string().optional(),
-});
+const GetClassOutlineInput = z.object({ file_path: z.string() });
+const GetMethodInput = z.object({ file_path: z.string(), method_name: z.string() });
 const ReadLinesInput = z.object({
   file_path: z.string(),
   start_line: z.number().int().positive(),
@@ -679,10 +524,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
-      case "get_class_structure": {
-        const { file_path, method_name } = GetClassStructureInput.parse(args);
-        const classes = getClassStructure(file_path, method_name ?? null);
+      case "get_class_outline": {
+        const { file_path } = GetClassOutlineInput.parse(args);
+        const classes = getClassOutline(file_path);
         return { content: [{ type: "text", text: JSON.stringify(classes) }] };
+      }
+
+      case "get_method": {
+        const { file_path, method_name } = GetMethodInput.parse(args);
+        const source = getMethod(file_path, method_name);
+        return { content: [{ type: "text", text: source }] };
       }
 
       case "read_lines": {
