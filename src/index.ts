@@ -336,17 +336,20 @@ function getClassOutline(filePath: string): ClassOutline[] {
 // Tool: get_method
 // ---------------------------------------------------------------------------
 
-function getMethod(filePath: string, methodName: string): string {
+function getMethod(filePath: string, methodName?: string, line?: number): string {
   const classes = getClassOutline(filePath);
 
   for (const cls of classes) {
-    const method = cls.methods.find((m) => m.name === methodName);
+    const method = methodName
+      ? cls.methods.find((m) => m.name === methodName)
+      : cls.methods.find((m) => line !== undefined && m.start_line <= line && line <= m.end_line);
     if (method) {
       return readLines(filePath, method.start_line, method.end_line);
     }
   }
 
-  throw new Error(`Method '${methodName}' not found in ${filePath}`);
+  if (methodName) throw new Error(`Method '${methodName}' not found in ${filePath}`);
+  throw new Error(`No method contains line ${line} in ${filePath}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -466,16 +469,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_method",
       description:
-        "Reads the full source code of a single PHP method by name. " +
-        "Call get_class_outline first if you don't know the method name. " +
-        "Prefer this over read_lines for reading PHP methods.",
+        "Reads the full source code of a single PHP method. " +
+        "Provide method_name OR line (a line number inside the method, e.g. from grep). " +
+        "Use line when you have a grep result and want the containing method without calling get_class_outline first.",
       inputSchema: {
         type: "object",
         properties: {
           file_path: { type: "string", description: "Absolute path to the PHP file" },
-          method_name: { type: "string", description: "Name of the method to read" },
+          method_name: { type: "string", description: "Method name — use when name is known" },
+          line: { type: "number", description: "Any line number inside the method — use when you have a grep result" },
         },
-        required: ["file_path", "method_name"],
+        required: ["file_path"],
       },
     },
     {
@@ -530,7 +534,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 const GetClassOutlineInput = z.object({ file_path: z.string() });
-const GetMethodInput = z.object({ file_path: z.string(), method_name: z.string() });
+const GetMethodInput = z.object({
+  file_path: z.string(),
+  method_name: z.string().optional(),
+  line: z.number().int().positive().optional(),
+});
 const ReadLinesInput = z.object({
   file_path: z.string(),
   start_line: z.number().int().positive(),
@@ -551,8 +559,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_method": {
-        const { file_path, method_name } = GetMethodInput.parse(args);
-        const source = getMethod(file_path, method_name);
+        const { file_path, method_name, line } = GetMethodInput.parse(args);
+        if (!method_name && !line) throw new Error("get_method requires method_name or line");
+        const source = getMethod(file_path, method_name, line);
         return { content: [{ type: "text", text: source }] };
       }
 
