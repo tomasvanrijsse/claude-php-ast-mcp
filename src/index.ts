@@ -9,7 +9,6 @@ import { execFileSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 
-// Configurable via env — mago may not be on PATH when Claude Code spawns the server
 const MAGO_PATH = process.env.MAGO_PATH || "mago";
 
 // ---------------------------------------------------------------------------
@@ -68,271 +67,280 @@ function offsetToLine(lineIndex: number[], offset: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// Span / position extraction helpers
+// Mago AST span helpers
+//
+// Mago span format: { file_id: N, start: { offset: N }, end: { offset: N } }
+// Token span (no file_id): same shape, just missing file_id
 // ---------------------------------------------------------------------------
 
-function extractSpan(node: Record<string, unknown>): { start: number; end: number } | null {
-  // mago uses Span { start: ByteOffset, end: ByteOffset }
-  // ByteOffset serialises as a plain number
+type SpanRange = { start: number; end: number };
+
+function getMagoSpanRange(spanLike: unknown): SpanRange | null {
+  if (!spanLike || typeof spanLike !== "object") return null;
+  const s = spanLike as Record<string, unknown>;
+  const startObj = s.start as Record<string, unknown> | undefined;
+  const endObj = s.end as Record<string, unknown> | undefined;
   if (
-    node.span &&
-    typeof (node.span as Record<string, unknown>).start === "number" &&
-    typeof (node.span as Record<string, unknown>).end === "number"
+    startObj && typeof startObj.offset === "number" &&
+    endObj && typeof endObj.offset === "number"
   ) {
-    const s = node.span as Record<string, unknown>;
-    return { start: s.start as number, end: s.end as number };
-  }
-  // Common alternative field names
-  for (const key of ["position", "loc", "range"]) {
-    const v = node[key] as Record<string, unknown> | undefined;
-    if (v && typeof v.start === "number" && typeof v.end === "number") {
-      return { start: v.start, end: v.end };
-    }
-  }
-  if (typeof node.start === "number" && typeof node.end === "number") {
-    return { start: node.start as number, end: node.end as number };
+    return { start: startObj.offset, end: endObj.offset };
   }
   return null;
 }
 
+// Node that carries a .span sub-field, e.g. { span: {...}, value: "Foo" }
+function getNodeSpan(node: Record<string, unknown>): SpanRange | null {
+  if (node.span) return getMagoSpanRange(node.span);
+  return getMagoSpanRange(node); // token IS the span
+}
+
 // ---------------------------------------------------------------------------
-// Name extraction — handles both plain strings and {value:"..."} objects
+// Mago value-node helpers
+// Node pattern: { type: "TypeName", value: { ... } }
 // ---------------------------------------------------------------------------
 
-function extractName(val: unknown): string | null {
+function nodeValue(node: unknown): Record<string, unknown> | null {
+  if (!node || typeof node !== "object") return null;
+  const n = node as Record<string, unknown>;
+  if (n.value && typeof n.value === "object" && !Array.isArray(n.value)) {
+    return n.value as Record<string, unknown>;
+  }
+  return null;
+}
+
+function nodeType(node: unknown): string | null {
+  if (!node || typeof node !== "object") return null;
+  const n = node as Record<string, unknown>;
+  if (typeof n.type === "string") return n.type;
+  return null;
+}
+
+function nodesOf(container: unknown): unknown[] {
+  if (!container || typeof container !== "object") return [];
+  const c = container as Record<string, unknown>;
+  if (Array.isArray(c.nodes)) return c.nodes;
+  return [];
+}
+
+// ---------------------------------------------------------------------------
+// Name / string extraction
+// ---------------------------------------------------------------------------
+
+function extractMagoName(val: unknown): string | null {
   if (typeof val === "string") return val;
-  if (val && typeof val === "object") {
-    const v = val as Record<string, unknown>;
-    if (typeof v.value === "string") return v.value;
-    if (typeof v.name === "string") return v.name;
-    // mago identifier nodes may carry the text via a nested object
-    for (const key of Object.keys(v)) {
-      const child = v[key];
-      if (typeof child === "string" && child.length > 0 && /^\w/.test(child)) return child;
-    }
-  }
+  if (!val || typeof val !== "object") return null;
+  const v = val as Record<string, unknown>;
+  // { span: {...}, value: "Foo" }
+  if (typeof v.value === "string") return v.value;
+  // { span: {...}, name: "$name" } (variable nodes)
+  if (typeof v.name === "string") return v.name;
   return null;
-}
-
-// ---------------------------------------------------------------------------
-// AST node type detection
-// ---------------------------------------------------------------------------
-
-// mago serialises enums with external tagging by default: {"ClassName": {...}}
-// but some nodes carry an explicit "kind" or "type" field.
-function getNodeKind(node: Record<string, unknown>): string | null {
-  if (typeof node.kind === "string") return node.kind;
-  if (typeof node.type === "string") return node.type;
-  if (typeof node.nodeType === "string") return node.nodeType;
-  // External tagging: single-key objects whose key is a PascalCase identifier
-  const keys = Object.keys(node);
-  if (keys.length === 1 && /^[A-Z]/.test(keys[0])) return keys[0];
-  return null;
-}
-
-const CLASS_LIKE_KINDS = new Set([
-  "ClassDeclaration", "Class",
-  "InterfaceDeclaration", "Interface",
-  "TraitDeclaration", "Trait",
-  "EnumDeclaration", "Enum",
-  "AnonymousClass",
-]);
-
-const METHOD_LIKE_KINDS = new Set([
-  "Method", "ClassMethod", "MethodDeclaration",
-  "AbstractMethod", "ConcreteMethod",
-  "Constructor", "Destructor",
-]);
-
-function isClassLike(kind: string): boolean {
-  if (CLASS_LIKE_KINDS.has(kind)) return true;
-  const lower = kind.toLowerCase();
-  return (
-    (lower.includes("class") || lower.includes("interface") ||
-     lower.includes("trait") || lower.includes("enum")) &&
-    !lower.includes("method") && !lower.includes("member")
-  );
-}
-
-function isMethodLike(kind: string): boolean {
-  if (METHOD_LIKE_KINDS.has(kind)) return true;
-  const lower = kind.toLowerCase();
-  return lower.includes("method") || lower.includes("function");
-}
-
-// ---------------------------------------------------------------------------
-// Visibility extraction
-// ---------------------------------------------------------------------------
-
-function extractVisibility(node: Record<string, unknown>): string {
-  // mago stores modifiers in a "modifiers" array or as boolean flags
-  const modifiers = node.modifiers;
-  if (Array.isArray(modifiers)) {
-    for (const m of modifiers) {
-      const s = typeof m === "string" ? m.toLowerCase() : extractName(m)?.toLowerCase() ?? "";
-      if (s === "public" || s === "protected" || s === "private") return s;
-    }
-  }
-  // Flat boolean flags
-  if (node.public === true || node.is_public === true) return "public";
-  if (node.protected === true || node.is_protected === true) return "protected";
-  if (node.private === true || node.is_private === true) return "private";
-  // Check flags field
-  if (node.flags && typeof node.flags === "object") {
-    const f = node.flags as Record<string, unknown>;
-    if (f.public) return "public";
-    if (f.protected) return "protected";
-    if (f.private) return "private";
-  }
-  return "public"; // PHP default for interface methods
-}
-
-function isStatic(node: Record<string, unknown>): boolean {
-  if (node.is_static === true) return true;
-  if (node.static === true) return true;
-  const modifiers = node.modifiers;
-  if (Array.isArray(modifiers)) {
-    return modifiers.some((m) => {
-      const s = typeof m === "string" ? m.toLowerCase() : extractName(m)?.toLowerCase() ?? "";
-      return s === "static";
-    });
-  }
-  return false;
-}
-
-function isAbstract(node: Record<string, unknown>): boolean {
-  if (node.is_abstract === true) return true;
-  if (node.abstract === true) return true;
-  const modifiers = node.modifiers;
-  if (Array.isArray(modifiers)) {
-    return modifiers.some((m) => {
-      const s = typeof m === "string" ? m.toLowerCase() : extractName(m)?.toLowerCase() ?? "";
-      return s === "abstract";
-    });
-  }
-  return false;
 }
 
 // ---------------------------------------------------------------------------
 // Type hint extraction
+// Mago type hints: { type: "Void"|"String"|...|"Local"|"Named"|"Nullable"|"Union"|..., value: {...} }
 // ---------------------------------------------------------------------------
 
-function extractTypeHint(val: unknown): string | null {
-  if (!val) return null;
-  if (typeof val === "string") return val;
-  if (typeof val === "object") {
-    const v = val as Record<string, unknown>;
-    const name = extractName(v);
-    if (name) return name;
-    // Union / intersection types
-    if (Array.isArray(v.types)) {
-      return (v.types as unknown[]).map(extractTypeHint).filter(Boolean).join("|");
-    }
-    if (Array.isArray(v.items)) {
-      return (v.items as unknown[]).map(extractTypeHint).filter(Boolean).join("|");
-    }
-    // Nullable: ?T
-    if (v.nullable === true && v.type) {
-      return "?" + (extractTypeHint(v.type) ?? "mixed");
-    }
-    if (v.inner || v.hint) return extractTypeHint(v.inner ?? v.hint);
+function extractMagoTypeHint(node: unknown): string | null {
+  if (!node || typeof node !== "object") return null;
+  const n = node as Record<string, unknown>;
+  const kind = nodeType(n);
+  if (!kind) return null;
+  const inner = nodeValue(n);
+
+  // Built-in scalar/special types — value contains { span, value: "string" }
+  const builtins = new Set([
+    "Void", "String", "Int", "Float", "Bool", "Array", "Object",
+    "Mixed", "Never", "Null", "False", "True", "Static", "Self",
+    "Parent", "Iterable", "Callable",
+  ]);
+  if (builtins.has(kind)) {
+    if (inner && typeof inner.value === "string") return inner.value;
+    return kind.toLowerCase();
   }
+
+  // Named / Local / FullyQualified / Qualified
+  if (["Local", "Named", "FullyQualified", "Qualified"].includes(kind) && inner) {
+    if (typeof inner.value === "string") return inner.value;
+  }
+
+  // Nullable: { type: "Nullable", value: { hint: {...} } }
+  if (kind === "Nullable" && inner) {
+    const hint = extractMagoTypeHint(inner.hint);
+    return hint ? "?" + hint : null;
+  }
+
+  // Union: { type: "Union", value: { types: { nodes: [...] } } }
+  if (kind === "Union" && inner) {
+    const parts = nodesOf(inner.types).map(extractMagoTypeHint).filter(Boolean);
+    return parts.length > 0 ? parts.join("|") : null;
+  }
+
+  // Intersection: similar
+  if (kind === "Intersection" && inner) {
+    const parts = nodesOf(inner.types).map(extractMagoTypeHint).filter(Boolean);
+    return parts.length > 0 ? parts.join("&") : null;
+  }
+
   return null;
 }
 
 // ---------------------------------------------------------------------------
-// Parameter extraction
+// Extends / implements extraction
+// { type: "Local"|"Named"|..., value: { span: {...}, value: "Bar" } }
 // ---------------------------------------------------------------------------
 
-function extractParameters(raw: unknown): ParameterInfo[] {
-  if (!raw) return [];
-  const list: unknown[] = Array.isArray(raw)
-    ? raw
-    : typeof raw === "object" && Array.isArray((raw as Record<string, unknown>).items)
-    ? ((raw as Record<string, unknown>).items as unknown[])
-    : [];
+function extractMagoFqn(node: unknown): string | null {
+  if (!node || typeof node !== "object") return null;
+  const n = node as Record<string, unknown>;
+  const kind = nodeType(n);
+  const inner = nodeValue(n);
+  if (inner && typeof inner.value === "string") return inner.value;
+  if (inner) {
+    // Qualified: { parts: { nodes: [{ span: {...}, value: "App" }, ...] } }
+    const parts = nodesOf(inner.parts);
+    if (parts.length > 0) {
+      return parts.map(extractMagoName).filter(Boolean).join("\\");
+    }
+  }
+  if (kind && typeof kind === "string") return kind; // fallback
+  return null;
+}
 
-  return list
+function extractImplementsList(typesContainer: unknown): string[] {
+  return nodesOf(typesContainer)
+    .map(extractMagoFqn)
+    .filter((s): s is string => s !== null);
+}
+
+// ---------------------------------------------------------------------------
+// Visibility / modifiers
+// Modifiers are { type: "Public"|"Private"|"Protected"|"Static"|"Abstract"|..., value: {...} }
+// ---------------------------------------------------------------------------
+
+function extractModifiers(modifiersContainer: unknown): string[] {
+  return nodesOf(modifiersContainer)
+    .map(nodeType)
+    .filter((t): t is string => t !== null)
+    .map((t) => t.toLowerCase());
+}
+
+function extractVisibilityFromModifiers(modifiers: string[]): string {
+  for (const m of modifiers) {
+    if (m === "public" || m === "protected" || m === "private") return m;
+  }
+  return "public";
+}
+
+// ---------------------------------------------------------------------------
+// Parameter extraction
+// Parameter node (not wrapped in type/value): { hint: {...}, variable: { span: {...}, name: "$foo" }, default_value: null }
+// ---------------------------------------------------------------------------
+
+function extractMagoParameters(paramListNode: unknown): ParameterInfo[] {
+  if (!paramListNode || typeof paramListNode !== "object") return [];
+  const pl = paramListNode as Record<string, unknown>;
+
+  // parameter_list: { parameters: { nodes: [...] } }
+  const params = nodesOf(pl.parameters);
+  if (params.length === 0) {
+    // Direct nodes array fallback
+    const direct = nodesOf(pl);
+    if (direct.length > 0) return parseParamNodes(direct);
+  }
+  return parseParamNodes(params);
+}
+
+function parseParamNodes(nodes: unknown[]): ParameterInfo[] {
+  return nodes
     .map((p): ParameterInfo | null => {
       if (!p || typeof p !== "object") return null;
       const param = p as Record<string, unknown>;
-      // Name field might be "$foo" or just "foo"
-      let name =
-        extractName(param.name ?? param.variable ?? param.var) ?? "?";
-      if (!name.startsWith("$")) name = "$" + name;
-      const type = extractTypeHint(param.type ?? param.type_hint ?? param.hint ?? null);
-      return { name, type, has_default: param.default != null || param.has_default === true };
+
+      const name = extractMagoName(param.variable) ?? "?";
+      const type = extractMagoTypeHint(param.hint ?? param.type_hint ?? param.type ?? null);
+      const has_default = param.default_value !== null && param.default_value !== undefined;
+
+      return { name, type, has_default };
     })
     .filter((p): p is ParameterInfo => p !== null);
 }
 
 // ---------------------------------------------------------------------------
-// Method extraction from a class-body subtree
+// Method extraction from class members list
 // ---------------------------------------------------------------------------
 
-function extractMethods(
-  bodyNode: unknown,
-  lineIndex: number[]
-): MethodInfo[] {
+const METHOD_TYPES = new Set(["Method", "AbstractMethod", "ConcreteMethod"]);
+
+function extractMagoMethods(membersContainer: unknown, lineIndex: number[]): MethodInfo[] {
   const methods: MethodInfo[] = [];
-  if (!bodyNode || typeof bodyNode !== "object") return methods;
 
-  // Find the members/methods array — it may be nested one level under "body" key
-  const candidates: unknown[] = [];
-  const body = bodyNode as Record<string, unknown>;
+  for (const member of nodesOf(membersContainer)) {
+    const kind = nodeType(member);
+    if (!kind || !METHOD_TYPES.has(kind)) continue;
 
-  for (const key of ["members", "items", "statements", "body", "methods"]) {
-    if (Array.isArray(body[key])) {
-      candidates.push(...(body[key] as unknown[]));
-    }
-  }
-  // Also recurse if body wraps another object
-  if (candidates.length === 0) {
-    for (const v of Object.values(body)) {
-      if (typeof v === "object" && v !== null && !Array.isArray(v)) {
-        return extractMethods(v, lineIndex);
+    const methodValue = nodeValue(member);
+    if (!methodValue) continue;
+
+    const modifiers = extractModifiers(methodValue.modifiers);
+    const name = extractMagoName(methodValue.name) ?? "<anonymous>";
+
+    // Start line: first modifier span, or the `function` keyword span
+    let startOffset: number | null = null;
+    const firstModifier = nodesOf(methodValue.modifiers)[0];
+    if (firstModifier) {
+      const mv = nodeValue(firstModifier);
+      if (mv) {
+        const s = getNodeSpan(mv);
+        if (s) startOffset = s.start;
       }
     }
-  }
-
-  for (const member of candidates) {
-    if (!member || typeof member !== "object") continue;
-    let memberNode = member as Record<string, unknown>;
-
-    // Handle external tagging: {"Method": {...}} or {"ConcreteMethod": {...}}
-    const kind = getNodeKind(memberNode);
-    if (kind) {
-      if (!isMethodLike(kind)) continue;
-      // Unwrap externally tagged nodes
-      if (
-        Object.keys(memberNode).length === 1 &&
-        typeof memberNode[kind] === "object"
-      ) {
-        memberNode = memberNode[kind] as Record<string, unknown>;
-      }
-    } else {
-      // No kind — only proceed if it has a name that looks like a method
-      if (!memberNode.name && !memberNode.identifier) continue;
+    if (startOffset === null && methodValue.function) {
+      const fnSpan = getNodeSpan(methodValue.function as Record<string, unknown>);
+      if (fnSpan) startOffset = fnSpan.start;
     }
 
-    const span = extractSpan(memberNode);
-    if (!span) continue;
+    // End line: body's right_brace or semicolon
+    let endOffset: number | null = null;
+    const body = methodValue.body;
+    if (body && typeof body === "object") {
+      const bodyKind = nodeType(body);
+      const bodyVal = nodeValue(body as Record<string, unknown>);
+      if (bodyVal) {
+        const rb = getNodeSpan(bodyVal.right_brace as Record<string, unknown>);
+        if (rb) endOffset = rb.end;
+        if (endOffset === null) {
+          const semi = getNodeSpan(bodyVal.semicolon as Record<string, unknown>);
+          if (semi) endOffset = semi.end;
+        }
+      }
+    }
+    // If still no end, use the name span end as fallback
+    if (endOffset === null) {
+      const nameSpan = getNodeSpan(methodValue.name as Record<string, unknown>);
+      if (nameSpan) endOffset = nameSpan.end;
+    }
 
-    const name = extractName(memberNode.name ?? memberNode.identifier) ?? "<anonymous>";
-    const returnType = extractTypeHint(
-      memberNode.return_type ?? memberNode.returnType ?? memberNode.returns ?? null
-    );
-    const parameters = extractParameters(
-      memberNode.parameters ?? memberNode.params ?? memberNode.arguments ?? null
-    );
+    if (startOffset === null || endOffset === null) continue;
+
+    const returnTypeNode = methodValue.return_type_hint;
+    let returnType: string | null = null;
+    if (returnTypeNode && typeof returnTypeNode === "object") {
+      const rtn = returnTypeNode as Record<string, unknown>;
+      returnType = extractMagoTypeHint(rtn.hint);
+    }
+
+    const parameters = extractMagoParameters(methodValue.parameter_list);
 
     methods.push({
       name,
-      visibility: extractVisibility(memberNode),
-      is_static: isStatic(memberNode),
-      is_abstract: isAbstract(memberNode),
-      start_line: offsetToLine(lineIndex, span.start),
-      end_line: offsetToLine(lineIndex, span.end),
+      visibility: extractVisibilityFromModifiers(modifiers),
+      is_static: modifiers.includes("static"),
+      is_abstract: modifiers.includes("abstract"),
+      start_line: offsetToLine(lineIndex, startOffset),
+      end_line: offsetToLine(lineIndex, endOffset),
       parameters,
       return_type: returnType,
     });
@@ -342,121 +350,133 @@ function extractMethods(
 }
 
 // ---------------------------------------------------------------------------
-// Fqn (fully qualified name) helpers for extends/implements
+// Class-like node detection
 // ---------------------------------------------------------------------------
 
-function extractFqn(val: unknown): string | null {
-  if (!val) return null;
-  if (typeof val === "string") return val;
-  if (typeof val === "object") {
-    const v = val as Record<string, unknown>;
-    // mago: { parts: ["App", "Models", "User"] }
-    if (Array.isArray(v.parts)) {
-      return (v.parts as unknown[]).map((p) => extractName(p) ?? String(p)).join("\\\\");
-    }
-    const name = extractName(v);
-    if (name) return name;
-    if (v.name) return extractFqn(v.name);
-  }
-  return null;
-}
+const CLASS_LIKE_TYPES = new Set([
+  "Class", "Interface", "Trait", "Enum",
+  "ClassDeclaration", "InterfaceDeclaration", "TraitDeclaration", "EnumDeclaration",
+]);
 
-function extractImplementsList(val: unknown): string[] {
-  if (!val) return [];
-  if (Array.isArray(val)) return val.map(extractFqn).filter((s): s is string => s !== null);
-  if (typeof val === "object") {
-    const v = val as Record<string, unknown>;
-    for (const key of ["interfaces", "items", "list"]) {
-      if (Array.isArray(v[key])) {
-        return (v[key] as unknown[]).map(extractFqn).filter((s): s is string => s !== null);
-      }
-    }
-    const name = extractFqn(v);
-    if (name) return [name];
-  }
-  return [];
+function classKindToType(kind: string): ClassInfo["type"] {
+  const lower = kind.toLowerCase();
+  if (lower.includes("interface")) return "interface";
+  if (lower.includes("trait")) return "trait";
+  if (lower.includes("enum")) return "enum";
+  return "class";
 }
 
 // ---------------------------------------------------------------------------
 // Main AST traversal — collect all class-like declarations
+// Recursively walks statement lists, following namespace bodies.
 // ---------------------------------------------------------------------------
 
 function collectClasses(
-  node: unknown,
+  statementNodes: unknown[],
   lineIndex: number[],
   currentNamespace: string | null = null
 ): ClassInfo[] {
-  if (!node || typeof node !== "object") return [];
-  if (Array.isArray(node)) {
-    return node.flatMap((child) => collectClasses(child, lineIndex, currentNamespace));
-  }
-
   const results: ClassInfo[] = [];
-  const obj = node as Record<string, unknown>;
 
-  const kind = getNodeKind(obj);
+  for (const stmt of statementNodes) {
+    const kind = nodeType(stmt);
+    if (!kind) continue;
 
-  // Track namespace context
-  if (kind === "Namespace" || kind === "NamespaceDeclaration" || kind === "NamespaceStatement") {
-    const nsName = extractFqn(obj.name ?? obj.identifier ?? obj.namespace) ?? currentNamespace;
-    // Recurse into namespace body
-    for (const val of Object.values(obj)) {
-      results.push(...collectClasses(val, lineIndex, nsName));
+    // Namespace statement: recurse into body
+    if (kind === "Namespace" || kind === "NamespaceDeclaration" || kind === "NamespaceStatement") {
+      const nsValue = nodeValue(stmt as Record<string, unknown>);
+      if (!nsValue) continue;
+
+      // Extract namespace name
+      const nsName = extractMagoFqn(nsValue.name) ?? currentNamespace;
+
+      // Body can be Implicit (semicolon-terminated) or Explicit (braced)
+      const body = nsValue.body;
+      if (!body || typeof body !== "object") continue;
+      const bodyKind = nodeType(body);
+      const bodyVal = nodeValue(body as Record<string, unknown>);
+      if (!bodyVal) continue;
+
+      const bodyStatements = nodesOf(bodyVal.statements);
+      results.push(...collectClasses(bodyStatements, lineIndex, nsName));
+      continue;
     }
-    return results;
-  }
 
-  // Class-like node
-  if (kind && isClassLike(kind)) {
-    // Unwrap externally tagged node if needed
-    let classNode = obj;
-    if (Object.keys(obj).length === 1 && typeof obj[kind] === "object" && obj[kind] !== null) {
-      classNode = obj[kind] as Record<string, unknown>;
-    }
+    // Class-like declaration
+    if (CLASS_LIKE_TYPES.has(kind)) {
+      const classValue = nodeValue(stmt as Record<string, unknown>);
+      if (!classValue) continue;
 
-    const span = extractSpan(classNode);
-    const className = extractName(classNode.name ?? classNode.identifier);
-    if (className && span) {
-      const classType = kind.toLowerCase().includes("interface")
-        ? "interface"
-        : kind.toLowerCase().includes("trait")
-        ? "trait"
-        : kind.toLowerCase().includes("enum")
-        ? "enum"
-        : "class";
+      const className = extractMagoName(classValue.name);
+      if (!className) continue;
 
-      // Namespace may be declared on the class itself in some AST formats
-      const ns =
-        extractFqn(classNode.namespace ?? classNode.namespaceName) ??
-        currentNamespace;
+      // Class span: start = `class`/`interface`/`trait`/`enum` keyword span start
+      // end = right_brace span end
+      let startOffset: number | null = null;
+      let endOffset: number | null = null;
 
-      const extendsName = extractFqn(
-        classNode.extends ?? classNode.parent ?? classNode.base_class ?? null
-      );
-      const implementsList = extractImplementsList(
-        classNode.implements ?? classNode.interfaces ?? null
-      );
+      // Keyword token (classValue.class / classValue.interface / classValue.trait / classValue.enum)
+      for (const kw of ["class", "interface", "trait", "enum"]) {
+        const kwToken = classValue[kw];
+        if (kwToken && typeof kwToken === "object") {
+          const kwSpan = getMagoSpanRange(kwToken);
+          if (kwSpan) { startOffset = kwSpan.start; break; }
+          // Might have a nested span
+          const kwObj = kwToken as Record<string, unknown>;
+          const s = getMagoSpanRange(kwObj.span);
+          if (s) { startOffset = s.start; break; }
+        }
+      }
+      // Fallback: use name span start
+      if (startOffset === null) {
+        const nameNode = classValue.name as Record<string, unknown> | undefined;
+        if (nameNode) {
+          const ns = getNodeSpan(nameNode);
+          if (ns) startOffset = ns.start;
+        }
+      }
 
-      const bodyKey = classNode.body ?? classNode.members ?? classNode.items;
-      const methods = extractMethods(bodyKey, lineIndex);
+      // right_brace token IS the span object
+      const rb = classValue.right_brace;
+      if (rb && typeof rb === "object") {
+        const rbSpan = getMagoSpanRange(rb);
+        if (rbSpan) endOffset = rbSpan.end;
+      }
+
+      if (startOffset === null || endOffset === null) continue;
+
+      // Namespace override from class itself (some formats)
+      const ns = currentNamespace;
+
+      // Extends
+      let extendsName: string | null = null;
+      if (classValue.extends && typeof classValue.extends === "object") {
+        const extendsObj = classValue.extends as Record<string, unknown>;
+        // { extends: { keyword }, types: { nodes: [...] } }
+        const extendsNodes = nodesOf(extendsObj.types);
+        if (extendsNodes.length > 0) extendsName = extractMagoFqn(extendsNodes[0]);
+      }
+
+      // Implements
+      let implementsList: string[] = [];
+      if (classValue.implements && typeof classValue.implements === "object") {
+        const implObj = classValue.implements as Record<string, unknown>;
+        implementsList = extractImplementsList(implObj.types);
+      }
+
+      const methods = extractMagoMethods(classValue.members, lineIndex);
 
       results.push({
         name: className,
-        type: classType as ClassInfo["type"],
+        type: classKindToType(kind),
         namespace: ns,
         extends: extendsName,
         implements: implementsList,
-        start_line: offsetToLine(lineIndex, span.start),
-        end_line: offsetToLine(lineIndex, span.end),
+        start_line: offsetToLine(lineIndex, startOffset),
+        end_line: offsetToLine(lineIndex, endOffset),
         methods,
       });
     }
-    // Still recurse for nested classes (rare but valid PHP)
-  }
-
-  // Recurse into all object values
-  for (const val of Object.values(obj)) {
-    results.push(...collectClasses(val, lineIndex, currentNamespace));
   }
 
   return results;
@@ -496,7 +516,12 @@ function getClassStructure(filePath: string): ClassInfo[] {
     throw new Error("mago produced invalid JSON. Check mago version and --json flag support.");
   }
 
-  return collectClasses(ast, lineIndex);
+  // Top-level: { program: { statements: { nodes: [...] } } }
+  const prog = (ast as Record<string, unknown>).program as Record<string, unknown> | undefined;
+  if (!prog) throw new Error("Unexpected mago AST shape: missing 'program' key.");
+
+  const topNodes = nodesOf(prog.statements);
+  return collectClasses(topNodes, lineIndex, null);
 }
 
 // ---------------------------------------------------------------------------
@@ -522,35 +547,29 @@ function readLines(filePath: string, startLine: number, endLine: number): string
 // ---------------------------------------------------------------------------
 
 function findClassFile(className: string, projectRoot: string): string {
-  // Normalise: leading backslash is optional
-  const normalized = className.replace(/^\\/,  "");
+  const normalized = className.replace(/^\\/, "");
 
   const classmapPath = path.join(projectRoot, "vendor/composer/autoload_classmap.php");
   if (fs.existsSync(classmapPath)) {
     const content = fs.readFileSync(classmapPath, "utf8");
-    // Match both $baseDir and $vendorDir variable prefixes
     const pattern = new RegExp(
       `'${escapeRegex(normalized)}'\\s*=>\\s*\\$(?:baseDir|vendorDir)\\s*\\.\\s*'([^']+)'`
     );
     const match = pattern.exec(content);
     if (match) {
-      // Resolve relative to the project root (baseDir = projectRoot)
       return path.resolve(projectRoot, match[1].replace(/^\//, ""));
     }
   }
 
-  // PSR-4 fallback
   const psr4Path = path.join(projectRoot, "vendor/composer/autoload_psr4.php");
   if (fs.existsSync(psr4Path)) {
     const content = fs.readFileSync(psr4Path, "utf8");
-    // Extract entries: 'Namespace\\' => array($baseDir . '/src')
     const entryPattern = /'([^']+)'\s*=>\s*array\s*\(\s*\$(?:baseDir|vendorDir)\s*\.\s*'([^']+)'/g;
     let entryMatch: RegExpExecArray | null;
     const mappings: Array<{ prefix: string; dir: string }> = [];
     while ((entryMatch = entryPattern.exec(content)) !== null) {
       mappings.push({ prefix: entryMatch[1], dir: entryMatch[2].replace(/^\//, "") });
     }
-    // Sort by prefix length descending for most-specific match first
     mappings.sort((a, b) => b.prefix.length - a.prefix.length);
 
     for (const { prefix, dir } of mappings) {
@@ -573,7 +592,7 @@ function escapeRegex(s: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Tool: debug_ast — shows raw AST excerpt for troubleshooting
+// Tool: debug_ast
 // ---------------------------------------------------------------------------
 
 function debugAst(filePath: string): string {
@@ -591,7 +610,6 @@ function debugAst(filePath: string): string {
     throw new Error(`Failed to run mago: ${msg}`);
   }
 
-  // Return first 4 KB to avoid flooding the context
   return astJson.length > 4096 ? astJson.slice(0, 4096) + "\n… (truncated)" : astJson;
 }
 
@@ -671,7 +689,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
-// Input schemas for validation
 const GetClassStructureInput = z.object({ file_path: z.string() });
 const ReadLinesInput = z.object({
   file_path: z.string(),
@@ -715,7 +732,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    return { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
+    return { content: [{ type: "text", text: `Error: ${message}` }, ], isError: true };
   }
 });
 
