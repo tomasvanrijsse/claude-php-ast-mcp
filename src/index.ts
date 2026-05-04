@@ -272,6 +272,26 @@ function collectClassOutlines(
 }
 
 // ---------------------------------------------------------------------------
+// Compact text formatter for class outlines
+// Saves ~70-85% vs JSON on files with many methods.
+// Format:
+//   ClassName [Namespace] extends Parent implements I1,I2
+//     methodName:start-end
+// ---------------------------------------------------------------------------
+
+function formatClassOutlines(classes: ClassOutline[]): string {
+  return classes.map((cls) => {
+    const parts: string[] = [cls.class];
+    if (cls.namespace) parts.push(`[${cls.namespace}]`);
+    if (cls.extends) parts.push(`extends ${cls.extends}`);
+    if (cls.implements.length > 0) parts.push(`implements ${cls.implements.join(",")}`);
+    const header = parts.join(" ");
+    const methods = cls.methods.map((m) => `  ${m.name}:${m.start_line}-${m.end_line}`).join("\n");
+    return methods ? `${header}\n${methods}` : header;
+  }).join("\n---\n");
+}
+
+// ---------------------------------------------------------------------------
 // Tool: get_class_outline
 // ---------------------------------------------------------------------------
 
@@ -310,6 +330,19 @@ function getClassOutline(filePath: string): ClassOutline[] {
 
   const topNodes = nodesOf(prog.statements);
   return collectClassOutlines(topNodes, lineIndex);
+}
+
+// ---------------------------------------------------------------------------
+// Tool: find_method — returns line range only, no source
+// ---------------------------------------------------------------------------
+
+function findMethodRange(filePath: string, methodName: string): string {
+  const classes = getClassOutline(filePath);
+  for (const cls of classes) {
+    const method = cls.methods.find((m) => m.name === methodName);
+    if (method) return `${method.start_line}-${method.end_line}`;
+  }
+  throw new Error(`Method '${methodName}' not found in ${filePath}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +477,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "find_method",
+      description:
+        "Returns only the line range (e.g. '273-398') for a named method. " +
+        "Use when you know the method name and only need to locate it, not read it. " +
+        "Cheaper than get_class_outline when you don't need all method names. " +
+        "Follow up with read_lines to fetch the source.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          file_path: { type: "string", description: "Absolute path to the PHP file" },
+          method_name: { type: "string", description: "Exact method name to locate" },
+        },
+        required: ["file_path", "method_name"],
+      },
+    },
+    {
       name: "get_method",
       description:
         "Reads the full source code of a single PHP method by name. " +
@@ -527,7 +576,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "get_class_outline": {
         const { file_path } = GetClassOutlineInput.parse(args);
         const classes = getClassOutline(file_path);
-        return { content: [{ type: "text", text: JSON.stringify(classes) }] };
+        return { content: [{ type: "text", text: formatClassOutlines(classes) }] };
+      }
+
+      case "find_method": {
+        const { file_path, method_name } = GetMethodInput.parse(args);
+        const range = findMethodRange(file_path, method_name);
+        return { content: [{ type: "text", text: range }] };
       }
 
       case "get_method": {
