@@ -1,0 +1,9 @@
+{
+  "name": "php-ast-mcp",
+  "version": "1.0.0",
+  "description": "PHP class explorer for Claude Code. Provides get_class_outline, get_method, find_class_file, and read_lines MCP tools plus a php-explorer subagent for efficient class exploration with minimal token usage.",
+  "author": {
+    "name": "Tomas van Rijsse",
+    "email": "tomas@pionect.nl"
+  }
+}
